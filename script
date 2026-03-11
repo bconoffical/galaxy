@@ -231,16 +231,16 @@ end
 -- ══════════════════════════════════════
 -- ESP BOXES — 2D bounding box per enemy
 -- Green = visible, Red = behind wall
--- Uses Drawing lines (4 per player)
+-- Optimized: head+feet projection only, raycasts throttled to ~6fps
 -- ══════════════════════════════════════
 
 local function newBoxLines()
     local lines = {}
-    for i=1,4 do
+    for i = 1, 4 do
         local l = Drawing.new("Line")
-        l.Visible    = false
-        l.Thickness  = 1.8
-        l.Color      = Color3.fromRGB(0,255,80)
+        l.Visible     = false
+        l.Thickness   = 1.8
+        l.Color       = Color3.fromRGB(0, 255, 80)
         l.Transparency = 0
         lines[i] = l
     end
@@ -248,81 +248,64 @@ local function newBoxLines()
 end
 
 local function destroyBoxLines(lines)
-    for _,l in ipairs(lines) do
-        pcall(function() l:Destroy() end)  -- Destroy, not Remove
-    end
+    for _, l in ipairs(lines) do pcall(function() l:Destroy() end) end
 end
 
 local function setBoxColor(lines, col)
-    for _,l in ipairs(lines) do l.Color = col end
+    for _, l in ipairs(lines) do l.Color = col end
 end
 
 local function drawBox(lines, x, y, w, h)
-    lines[1].From=Vector2.new(x,   y);   lines[1].To=Vector2.new(x+w, y)    -- top
-    lines[2].From=Vector2.new(x,   y+h); lines[2].To=Vector2.new(x+w, y+h)  -- bottom
-    lines[3].From=Vector2.new(x,   y);   lines[3].To=Vector2.new(x,   y+h)  -- left
-    lines[4].From=Vector2.new(x+w, y);   lines[4].To=Vector2.new(x+w, y+h)  -- right
-    for _,l in ipairs(lines) do l.Visible = true end
+    lines[1].From = Vector2.new(x,     y);   lines[1].To = Vector2.new(x + w, y)
+    lines[2].From = Vector2.new(x,     y+h); lines[2].To = Vector2.new(x + w, y+h)
+    lines[3].From = Vector2.new(x,     y);   lines[3].To = Vector2.new(x,     y+h)
+    lines[4].From = Vector2.new(x + w, y);   lines[4].To = Vector2.new(x + w, y+h)
+    for _, l in ipairs(lines) do l.Visible = true end
 end
 
 local function hideBox(lines)
-    for _,l in ipairs(lines) do l.Visible = false end
+    for _, l in ipairs(lines) do l.Visible = false end
 end
 
--- Optimized bounding box: only sample the character's key parts
--- (Head, HumanoidRootPart, UpperTorso/Torso, LeftFoot/RightFoot)
--- Uses sp.Z > 0 check instead of onScreen flag so we don't miss
--- parts that are technically "behind" the near-plane boundary.
-local KEY_PARTS = {"Head","HumanoidRootPart","UpperTorso","Torso","LeftFoot","RightFoot","LeftHand","RightHand"}
-local function getCharBox(ch)
-    local minX,minY = math.huge, math.huge
-    local maxX,maxY = -math.huge,-math.huge
-    local found = false
+-- Fast box: project Head top and HumanoidRootPart bottom to get screen rect.
+-- No corner sampling — two WorldToViewportPoint calls per player.
+local function getCharBoxFast(ch)
+    local head = ch:FindFirstChild("Head")
+    local root = ch:FindFirstChild("HumanoidRootPart")
+    if not head or not root then return nil end
 
-    for _,name in ipairs(KEY_PARTS) do
-        local part = ch:FindFirstChild(name)
-        if part and part:IsA("BasePart") then
-            local sz = part.Size * 0.5
-            local cf = part.CFrame
-            -- Sample all 8 corners of this part's bounding box
-            for _,ox in ipairs({-sz.X, sz.X}) do
-                for _,oy in ipairs({-sz.Y, sz.Y}) do
-                    for _,oz in ipairs({-sz.Z, sz.Z}) do
-                        local worldPos = (cf * CFrame.new(ox,oy,oz)).Position
-                        local sp = Cam:WorldToViewportPoint(worldPos)
-                        -- sp.Z > 0 means in front of camera (on screen or off edge)
-                        if sp.Z > 0 then
-                            if sp.X < minX then minX = sp.X end
-                            if sp.Y < minY then minY = sp.Y end
-                            if sp.X > maxX then maxX = sp.X end
-                            if sp.Y > maxY then maxY = sp.Y end
-                            found = true
-                        end
-                    end
-                end
-            end
-        end
-    end
+    local headSP = Cam:WorldToViewportPoint(head.Position + Vector3.new(0, head.Size.Y * 0.5, 0))
+    local rootSP = Cam:WorldToViewportPoint(root.Position - Vector3.new(0, root.Size.Y * 0.5, 0))
 
-    if not found then return nil end
-    -- Clamp to viewport so lines don't go wild off-screen
-    local vp = Cam.ViewportSize
-    minX = math.clamp(minX, 0, vp.X)
-    minY = math.clamp(minY, 0, vp.Y)
-    maxX = math.clamp(maxX, 0, vp.X)
-    maxY = math.clamp(maxY, 0, vp.Y)
-    local w = maxX - minX
-    local h = maxY - minY
-    if w < 4 or h < 4 then return nil end  -- too small to draw
-    return minX, minY, w, h
+    -- Both must be in front of camera
+    if headSP.Z <= 0 or rootSP.Z <= 0 then return nil end
+
+    local vp   = Cam.ViewportSize
+    local topY = math.clamp(math.min(headSP.Y, rootSP.Y), 0, vp.Y)
+    local botY = math.clamp(math.max(headSP.Y, rootSP.Y), 0, vp.Y)
+    local h    = botY - topY
+    if h < 6 then return nil end
+
+    -- Width proportional to height (typical character aspect)
+    local w    = h * 0.55
+    local midX = math.clamp((headSP.X + rootSP.X) * 0.5, 0, vp.X)
+    local x    = math.clamp(midX - w * 0.5, 0, vp.X)
+    w = math.min(w, vp.X - x)
+
+    return x, topY, w, h
 end
+
+-- Per-player visibility cache: updated every ~10 frames to avoid raycast spam
+local visCache  = {}   -- [UserId] = true/false
+local visTick   = {}   -- [UserId] = last update frame index
+local frameIdx  = 0
+local VIS_INTERVAL = 10  -- update visibility every N frames
 
 local function clearBoxes()
-    for _,lines in pairs(State.boxDrawings) do
-        destroyBoxLines(lines)
-    end
+    for _, lines in pairs(State.boxDrawings) do destroyBoxLines(lines) end
     State.boxDrawings = {}
-    if State.boxConn then State.boxConn:Disconnect(); State.boxConn=nil end
+    visCache = {}; visTick = {}
+    if State.boxConn then State.boxConn:Disconnect(); State.boxConn = nil end
 end
 
 local function startBoxes()
@@ -332,14 +315,16 @@ local function startBoxes()
     State.boxConn = RunService.RenderStepped:Connect(function()
         if not CFG.ESPBoxes then clearBoxes(); return end
 
+        frameIdx = frameIdx + 1
         local active = {}
 
-        for _,p in ipairs(Players:GetPlayers()) do
+        for _, p in ipairs(Players:GetPlayers()) do
             if not isEnemy(p) then continue end
-            local ch = p.Character; if not ch then continue end
+            local ch  = p.Character; if not ch then continue end
             local pid = p.UserId
             active[pid] = true
 
+            -- Create lines on demand
             if not State.boxDrawings[pid] then
                 State.boxDrawings[pid] = newBoxLines()
             end
@@ -348,25 +333,29 @@ local function startBoxes()
             local root = ch:FindFirstChild("HumanoidRootPart")
             if not root then hideBox(lines); continue end
 
-            -- Quick frustum check: is root in front of camera at all?
-            local rsp = Cam:WorldToViewportPoint(root.Position)
-            if rsp.Z <= 0 then hideBox(lines); continue end
-
-            local x, y, w, h = getCharBox(ch)
+            -- Fast box from head+root only
+            local x, y, w, h = getCharBoxFast(ch)
             if not x then hideBox(lines); continue end
 
-            local vis = isVisible(root.Position)
-            setBoxColor(lines, vis
-                and Color3.fromRGB(0, 255, 80)   -- green = line of sight
-                or  Color3.fromRGB(255, 40, 40))  -- red   = behind wall
+            -- Throttled visibility raycast
+            if (visTick[pid] or 0) + VIS_INTERVAL <= frameIdx then
+                visCache[pid] = isVisible(root.Position)
+                visTick[pid]  = frameIdx
+            end
+
+            local col = (visCache[pid] ~= false)
+                and Color3.fromRGB(0, 255, 80)
+                or  Color3.fromRGB(255, 40, 40)
+            setBoxColor(lines, col)
             drawBox(lines, x, y, w, h)
         end
 
-        -- Cleanup departed players
+        -- Remove lines for players who left
         for pid, lines in pairs(State.boxDrawings) do
             if not active[pid] then
                 destroyBoxLines(lines)
                 State.boxDrawings[pid] = nil
+                visCache[pid] = nil; visTick[pid] = nil
             end
         end
     end)
@@ -375,22 +364,20 @@ end
 -- ══════════════════════════════════════
 -- AIMBOT — Cursor-only (mousemoverel)
 --
--- ROOT FIX: GetMouseLocation() is stale within the same frame after
--- mousemoverel — using it as the "current" position causes overshoot
--- and pushes the cursor AWAY from the target.
--- Fix: maintain a virtual cursor that we update ourselves every time
--- we call mousemoverel, so delta is always computed correctly.
+-- THE FIX for cursor repel:
+--   GetMouseLocation() returns OS cursor pos which does NOT update
+--   within the same frame after mousemoverel(). Calling it every frame
+--   while tracking means our "current" position is always one frame
+--   behind, so delta overshoots and the cursor bounces away.
 --
--- Smoothness now uses exponential decay (1 - e^(-speed*dt)) which is
--- truly FPS-independent and never overshoots.
+--   Solution: seed vCursor ONCE from GetMouseLocation() when we first
+--   acquire a target. While we have a target, ONLY update vCursor by
+--   adding our own move vectors — never call GetMouseLocation() again
+--   until the target is lost. This way delta is always 100% accurate.
 -- ══════════════════════════════════════
 
--- Virtual cursor — our authoritative cursor position this frame
-local vCursor = nil
-
-local function syncVCursor()
-    vCursor = UserInput:GetMouseLocation()
-end
+local vCursor        = Vector2.new(0, 0)
+local vCursorSeeded  = false   -- have we seeded from real mouse yet?
 
 local function aimActive()
     if CFG.AimHold then return State.aimHolding end
@@ -398,65 +385,56 @@ local function aimActive()
 end
 
 local function stopAimbot()
-    if State.aimConn then State.aimConn:Disconnect(); State.aimConn=nil end
+    if State.aimConn then State.aimConn:Disconnect(); State.aimConn = nil end
     hideCrosshair()
     pcall(function() if State.fovRing then State.fovRing.Visible = false end end)
     State.lockedTarget = nil
-    syncVCursor()
+    vCursorSeeded = false  -- force re-seed next activation
 end
 
 local function startAimbot()
     stopAimbot()
-    syncVCursor()
-    local lastTime = tick()
+    vCursorSeeded = false
 
     State.aimConn = RunService.RenderStepped:Connect(function()
-        if not aimActive() then
-            -- Re-sync virtual cursor to real mouse whenever we're idle
-            syncVCursor()
-            hideCrosshair()
-            -- Passive FOV ring when toggle-on + ShowFOV
-            if CFG.AimOn and CFG.AimShowFOV and not CFG.AimHold then
-                pcall(function()
-                    if State.fovRing and vCursor then
-                        State.fovRing.Position = vCursor
-                        State.fovRing.Radius   = CFG.AimFOV
-                        State.fovRing.Visible  = true
-                    end
-                end)
+        local isActive = aimActive()
+
+        -- FOV ring: show whenever aimbot is "armed" (on OR hold-mode enabled)
+        -- regardless of whether we currently have a target
+        local showFOV = (CFG.AimOn or CFG.AimHold) and CFG.AimShowFOV
+        if State.fovRing then
+            if showFOV then
+                -- Use real mouse for ring when not tracking (no vCursor drift risk here)
+                local mp = isActive and vCursor or UserInput:GetMouseLocation()
+                State.fovRing.Position = Vector2.new(mp.X, mp.Y)
+                State.fovRing.Radius   = CFG.AimFOV
+                State.fovRing.Visible  = true
             else
-                pcall(function() if State.fovRing then State.fovRing.Visible = false end end)
+                State.fovRing.Visible = false
             end
+        end
+
+        if not isActive then
+            hideCrosshair()
             State.lockedTarget = nil
+            vCursorSeeded = false  -- reset so next activation re-seeds cleanly
             return
         end
 
-        local now = tick()
-        local dt  = math.clamp(now - lastTime, 0.001, 0.05)
-        lastTime  = now
+        -- Seed vCursor from real mouse exactly once when we become active
+        if not vCursorSeeded then
+            vCursor       = UserInput:GetMouseLocation()
+            vCursorSeeded = true
+        end
 
         local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-        if not root then hideCrosshair(); syncVCursor(); return end
-
-        -- Sync virtual cursor from real mouse if not initialized or drifted >12px
-        if not vCursor then syncVCursor() end
-        local realMouse = UserInput:GetMouseLocation()
-        if (vCursor - realMouse).Magnitude > 12 then vCursor = realMouse end
-
-        -- FOV ring follows virtual cursor
-        pcall(function()
-            if State.fovRing then
-                State.fovRing.Position = vCursor
-                State.fovRing.Radius   = CFG.AimFOV
-                State.fovRing.Visible  = CFG.AimShowFOV or State.crossVisible
-            end
-        end)
+        if not root then hideCrosshair(); State.lockedTarget = nil; return end
 
         local bestPart   = nil
         local bestPlayer = nil
         local bestDist   = math.huge
 
-        for _,p in ipairs(Players:GetPlayers()) do
+        for _, p in ipairs(Players:GetPlayers()) do
             if not isEnemy(p) then continue end
             local ch = p.Character; if not ch then continue end
 
@@ -471,7 +449,6 @@ local function startAimbot()
             if not onScreen then continue end
 
             local screenBone = Vector2.new(sp.X, sp.Y)
-            -- Compare against VIRTUAL cursor — correct this frame
             local cursorDist = (screenBone - vCursor).Magnitude
 
             if cursorDist <= CFG.AimFOV and cursorDist < bestDist then
@@ -484,30 +461,35 @@ local function startAimbot()
         if bestPart then
             local sp2, onSc2 = Cam:WorldToViewportPoint(bestPart.Position)
             if not onSc2 then
-                hideCrosshair(); State.lockedTarget=nil; State.crossVisible=false; return
+                hideCrosshair()
+                State.lockedTarget  = nil
+                State.crossVisible  = false
+                vCursorSeeded = false  -- lost target, re-seed next frame
+                return
             end
 
             local targetScreen = Vector2.new(sp2.X, sp2.Y)
-            -- Delta: from virtual cursor TO target — always the right direction
-            local delta  = targetScreen - vCursor
+            local delta        = targetScreen - vCursor  -- always correct direction
+
             local smooth = math.clamp(CFG.AimSmooth, 0.05, 1.0)
             local move
 
             if smooth >= 0.95 then
-                -- Instant snap: full delta in one frame
-                move = delta
+                move = delta  -- instant snap
             else
-                -- Exponential decay — FPS-independent, never overshoots
-                -- speed 0.05→~0.4/s, 0.94→~23/s
-                local speed  = smooth * 25
-                local factor = 1 - math.exp(-speed * dt)
-                move = delta * factor
+                -- Simple lerp fraction: smooth=0.05→5% per frame, smooth=0.94→94%
+                -- Feels natural and is predictable
+                move = delta * smooth
             end
 
-            if move.Magnitude > 0.08 then
+            if move.Magnitude > 0.05 then
                 mousemoverel(move.X, move.Y)
-                -- Update virtual cursor IMMEDIATELY so next frame delta is correct
-                vCursor = vCursor + move
+                vCursor = vCursor + move  -- track internally — never GetMouseLocation here
+            end
+
+            -- Update FOV ring to follow vCursor while tracking
+            if State.fovRing and CFG.AimShowFOV then
+                State.fovRing.Position = vCursor
             end
 
             updateCrosshair(targetScreen, true)
@@ -515,9 +497,9 @@ local function startAimbot()
             State.crossVisible = true
         else
             hideCrosshair()
-            State.crossVisible = false
-            State.lockedTarget = nil
-            syncVCursor()  -- no target — re-sync so we're fresh next lock
+            State.crossVisible  = false
+            State.lockedTarget  = nil
+            vCursorSeeded = false  -- no target — re-seed fresh on next lock
         end
     end)
 end
