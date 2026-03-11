@@ -6,7 +6,7 @@
 ║  ██║   ██║██╔══██║██║     ██╔══██║ ██╔██╗   ╚██╔╝   ║
 ║  ╚██████╔╝██║  ██║███████╗██║  ██║██╔╝ ██╗   ██║    ║
 ║   ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ║
-║              v5.2  —  CURSOR LOCK EDITION            ║
+║              v5.3  —  CURSOR LOCK EDITION            ║
 ╚══════════════════════════════════════════════════════╝
 --]]
 
@@ -25,20 +25,25 @@ if not GuiParent then GuiParent = LP:WaitForChild("PlayerGui") end
 -- CONFIG
 -- ══════════════════════════════════════
 local CFG = {
+    -- Aimbot
     AimOn          = false,
-    AimSmooth      = 0.18,
+    AimHold        = false,   -- hold key instead of toggle
+    AimSmooth      = 0.18,    -- 0.05=slow, 0.95=near-instant, 1.0=snap
     AimFOV         = 150,
     AimMaxDist     = 1200,
-    AimBone        = "Head",   -- "Head" or "HumanoidRootPart" (torso)
-    FlyOn          = false,
-    FlySpeed       = 80,
-    NoclipOn       = false,
+    AimBone        = "Head",  -- "Head" or "HumanoidRootPart"
+    AimShowFOV     = true,    -- always show FOV ring when aimbot enabled
+    -- Visuals
     ESPOn          = true,
     ESPWalls       = true,
     ESPOutlineOnly = false,
+    ESPBoxes       = false,   -- 2D bounding boxes (green=visible, red=behind wall)
+    -- Movement
+    FlyOn          = false,
+    FlySpeed       = 80,
+    NoclipOn       = false,
 }
 
--- Keybinds stored as strings, resolved dynamically
 local BINDS = {
     MenuKey   = "Insert",
     AimKey    = "End",
@@ -49,12 +54,14 @@ local BINDS = {
 local State = {
     flyBV=nil, flyBG=nil,
     espHL={},
-    aimConn=nil, noclipConn=nil,
-    -- crosshair Drawing objects
+    boxDrawings={},          -- per-player box drawing objects
+    aimConn=nil, noclipConn=nil, boxConn=nil,
+    -- crosshair / FOV Drawing objects
     crossH=nil, crossV=nil, crossTop=nil, crossBot=nil,
     crossDot=nil, fovRing=nil,
     crossVisible=false,
     lockedTarget=nil,
+    aimHolding=false,        -- is hold key currently pressed
     dragOn=false, dragStart=nil, dragStartPos=nil,
     menuOpen=false, minimized=false,
     starObjs={}, nebulaObjs={},
@@ -81,11 +88,19 @@ local function hsv(h,s,v)
     local c=t2[(i%6)+1]; return Color3.new(c[1],c[2],c[3])
 end
 
-local function keyFromName(name)
-    -- Safely get Enum.KeyCode from string name
-    local ok, val = pcall(function() return Enum.KeyCode[name] end)
-    if ok and val then return val end
-    return nil
+-- Raycast from camera to world pos to check visibility
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+local function isVisible(targetPos)
+    local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    local origin = Cam.CFrame.Position
+    local dir    = (targetPos - origin)
+    rayParams.FilterDescendantsInstances = {LP.Character, workspace.CurrentCamera}
+    local result = workspace:Raycast(origin, dir, rayParams)
+    if not result then return true end  -- nothing hit, clear line of sight
+    -- If the hit is very close to target, consider visible
+    return (result.Position - targetPos).Magnitude < 2
 end
 
 -- ══════════════════════════════════════
@@ -117,11 +132,10 @@ local function initCrosshair()
         State.crossDot.Filled = true; State.crossDot.Color = Color3.fromRGB(255,255,255)
         State.crossDot.Transparency = 0; State.crossDot.Thickness = 1
 
-        -- FOV ring follows mouse cursor
         State.fovRing = Drawing.new("Circle")
         State.fovRing.Visible = false; State.fovRing.Radius = CFG.AimFOV
         State.fovRing.Filled = false; State.fovRing.Color = Color3.fromRGB(160,60,255)
-        State.fovRing.Transparency = 0.4; State.fovRing.Thickness = 1.5
+        State.fovRing.Transparency = 0.35; State.fovRing.Thickness = 1.5
     end)
 end
 
@@ -159,7 +173,12 @@ local function updateFOVRing(mousePos)
         if State.fovRing then
             State.fovRing.Position = mousePos
             State.fovRing.Radius   = CFG.AimFOV
-            State.fovRing.Visible  = CFG.AimOn
+            -- Show if: aimbot on AND (ShowFOV option OR currently active)
+            local shouldShow = CFG.AimOn and (CFG.AimShowFOV or State.crossVisible)
+            if CFG.AimHold then
+                shouldShow = State.aimHolding and (CFG.AimShowFOV or State.crossVisible)
+            end
+            State.fovRing.Visible = shouldShow
         end
     end)
 end
@@ -177,7 +196,7 @@ end
 initCrosshair()
 
 -- ══════════════════════════════════════
--- ESP
+-- ESP — HIGHLIGHTS
 -- ══════════════════════════════════════
 local function clearESP()
     for _,h in ipairs(State.espHL) do pcall(function() h:Destroy() end) end
@@ -203,44 +222,213 @@ local function applyESP()
 end
 
 Players.PlayerAdded:Connect(function(p)
-    p.CharacterAdded:Connect(function() task.wait(0.8); applyESP() end)
+    p.CharacterAdded:Connect(function() task.wait(0.8); applyESP(); end)
 end)
 for _,p in ipairs(Players:GetPlayers()) do
     if p~=LP then p.CharacterAdded:Connect(function() task.wait(0.8); applyESP() end) end
 end
 
 -- ══════════════════════════════════════
--- AIMBOT — Cursor-only lock (mousemoverel)
---
--- Does NOT touch the camera.
--- Every RenderStepped:
---   1. Get current mouse position
---   2. For each enemy, project their target bone (Head or Torso) to screen
---   3. If within AimFOV px of cursor AND within max world dist → candidate
---   4. Pick closest candidate to cursor
---   5. Move cursor toward target using mousemoverel (smooth lerp)
---   6. Draw crosshair at target screen pos
+-- ESP BOXES — 2D bounding box per enemy
+-- Green = visible, Red = behind wall
+-- Uses Drawing quads (4 lines per player)
 -- ══════════════════════════════════════
+
+-- We store per-player a table of 4 line Drawing objects
+local function newBoxLines()
+    local lines = {}
+    for i=1,4 do
+        local l = Drawing.new("Line")
+        l.Visible = false
+        l.Thickness = 1.8
+        l.Color = Color3.fromRGB(0,255,80)
+        l.Transparency = 0
+        lines[i] = l
+    end
+    return lines
+end
+
+local function destroyBoxLines(lines)
+    for _,l in ipairs(lines) do pcall(function() l:Remove() end) end
+end
+
+local function setBoxColor(lines, col)
+    for _,l in ipairs(lines) do l.Color = col end
+end
+
+local function drawBox(lines, x, y, w, h)
+    -- Top
+    lines[1].From = Vector2.new(x,   y);   lines[1].To = Vector2.new(x+w, y)
+    -- Bottom
+    lines[2].From = Vector2.new(x,   y+h); lines[2].To = Vector2.new(x+w, y+h)
+    -- Left
+    lines[3].From = Vector2.new(x,   y);   lines[3].To = Vector2.new(x,   y+h)
+    -- Right
+    lines[4].From = Vector2.new(x+w, y);   lines[4].To = Vector2.new(x+w, y+h)
+    for _,l in ipairs(lines) do l.Visible = true end
+end
+
+local function hideBox(lines)
+    for _,l in ipairs(lines) do l.Visible = false end
+end
+
+-- Get 2D bounding box for a character on screen
+-- Returns x, y, w, h in screen coords (top-left origin)
+local function getCharBox(ch)
+    local pts = {}
+    for _,part in ipairs(ch:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local sz = part.Size
+            -- sample 8 corners
+            local cf = part.CFrame
+            local corners = {
+                cf * CFrame.new( sz.X/2,  sz.Y/2,  sz.Z/2),
+                cf * CFrame.new(-sz.X/2,  sz.Y/2,  sz.Z/2),
+                cf * CFrame.new( sz.X/2, -sz.Y/2,  sz.Z/2),
+                cf * CFrame.new(-sz.X/2, -sz.Y/2,  sz.Z/2),
+                cf * CFrame.new( sz.X/2,  sz.Y/2, -sz.Z/2),
+                cf * CFrame.new(-sz.X/2,  sz.Y/2, -sz.Z/2),
+                cf * CFrame.new( sz.X/2, -sz.Y/2, -sz.Z/2),
+                cf * CFrame.new(-sz.X/2, -sz.Y/2, -sz.Z/2),
+            }
+            for _,c in ipairs(corners) do
+                local sp, onSc = Cam:WorldToViewportPoint(c.Position)
+                if onSc then pts[#pts+1] = Vector2.new(sp.X, sp.Y) end
+            end
+        end
+    end
+    if #pts < 2 then return nil end
+    local minX,minY = math.huge, math.huge
+    local maxX,maxY = -math.huge, -math.huge
+    for _,v in ipairs(pts) do
+        if v.X < minX then minX=v.X end
+        if v.Y < minY then minY=v.Y end
+        if v.X > maxX then maxX=v.X end
+        if v.Y > maxY then maxY=v.Y end
+    end
+    return minX, minY, maxX-minX, maxY-minY
+end
+
+local function clearBoxes()
+    for pid, lines in pairs(State.boxDrawings) do
+        destroyBoxLines(lines)
+    end
+    State.boxDrawings = {}
+    if State.boxConn then State.boxConn:Disconnect(); State.boxConn=nil end
+end
+
+local function startBoxes()
+    clearBoxes()
+    if not CFG.ESPBoxes then return end
+
+    State.boxConn = RunService.RenderStepped:Connect(function()
+        if not CFG.ESPBoxes then clearBoxes(); return end
+
+        local active = {}
+
+        for _,p in ipairs(Players:GetPlayers()) do
+            if not isEnemy(p) then continue end
+            local ch = p.Character; if not ch then continue end
+            local pid = p.UserId
+
+            -- Ensure lines exist
+            if not State.boxDrawings[pid] then
+                State.boxDrawings[pid] = newBoxLines()
+            end
+            local lines = State.boxDrawings[pid]
+            active[pid] = true
+
+            local root = ch:FindFirstChild("HumanoidRootPart")
+            if not root then hideBox(lines); continue end
+
+            local x, y, w, h = getCharBox(ch)
+            if not x then hideBox(lines); continue end
+
+            -- Color: green if line of sight to root, red if behind wall
+            local vis = isVisible(root.Position)
+            local col = vis
+                and Color3.fromRGB(0, 255, 80)    -- green = visible
+                or  Color3.fromRGB(255, 40, 40)   -- red   = behind wall
+
+            setBoxColor(lines, col)
+            drawBox(lines, x, y, w, h)
+        end
+
+        -- Clean up lines for players no longer tracked
+        for pid, lines in pairs(State.boxDrawings) do
+            if not active[pid] then
+                destroyBoxLines(lines)
+                State.boxDrawings[pid] = nil
+            end
+        end
+    end)
+end
+
+-- ══════════════════════════════════════
+-- AIMBOT — Cursor-only (mousemoverel)
+--
+-- Accuracy improvements:
+--  • Uses frame-delta scaling so speed is consistent at any FPS
+--  • Predicts movement by offsetting toward velocity vector
+--  • Smoothness 0.95+ = instant snap (no lerp)
+--  • Hold mode: only tracks while AimKey held
+-- ══════════════════════════════════════
+local function aimActive()
+    if CFG.AimHold then return State.aimHolding end
+    return CFG.AimOn
+end
+
 local function stopAimbot()
     if State.aimConn then State.aimConn:Disconnect(); State.aimConn=nil end
     hideCrosshair()
-    pcall(function()
-        if State.fovRing then State.fovRing.Visible = false end
-    end)
+    pcall(function() if State.fovRing then State.fovRing.Visible = false end end)
     State.lockedTarget = nil
 end
 
 local function startAimbot()
     stopAimbot()
 
+    local lastTime = tick()
+
     State.aimConn = RunService.RenderStepped:Connect(function()
-        if not CFG.AimOn then return end
+        -- FOV ring visibility managed separately when AimShowFOV is on
+        if CFG.AimOn and CFG.AimShowFOV and not CFG.AimHold then
+            pcall(function()
+                local mp = UserInput:GetMouseLocation()
+                if State.fovRing then
+                    State.fovRing.Position = Vector2.new(mp.X, mp.Y)
+                    State.fovRing.Radius   = CFG.AimFOV
+                    State.fovRing.Visible  = true
+                end
+            end)
+        end
+
+        if not aimActive() then
+            hideCrosshair()
+            if not (CFG.AimOn and CFG.AimShowFOV and not CFG.AimHold) then
+                pcall(function() if State.fovRing then State.fovRing.Visible = false end end)
+            end
+            State.lockedTarget = nil
+            return
+        end
+
+        local now = tick()
+        local dt  = math.clamp(now - lastTime, 0.001, 0.05)
+        lastTime  = now
 
         local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         if not root then hideCrosshair(); return end
 
         local mousePos = UserInput:GetMouseLocation()
-        updateFOVRing(Vector2.new(mousePos.X, mousePos.Y))
+
+        -- Always update FOV ring to follow cursor
+        pcall(function()
+            if State.fovRing then
+                State.fovRing.Position = Vector2.new(mousePos.X, mousePos.Y)
+                State.fovRing.Radius   = CFG.AimFOV
+                State.fovRing.Visible  = true
+            end
+        end)
 
         local bestPart   = nil
         local bestPlayer = nil
@@ -250,11 +438,8 @@ local function startAimbot()
             if not isEnemy(p) then continue end
             local ch = p.Character; if not ch then continue end
 
-            -- Select bone based on config
             local bone = ch:FindFirstChild(CFG.AimBone)
-            if not bone then
-                bone = ch:FindFirstChild("HumanoidRootPart")
-            end
+            if not bone then bone = ch:FindFirstChild("HumanoidRootPart") end
             if not bone then continue end
 
             local worldDist = (bone.Position - root.Position).Magnitude
@@ -274,22 +459,35 @@ local function startAimbot()
         end
 
         if bestPart then
-            local sp2, _ = Cam:WorldToViewportPoint(bestPart.Position)
-            local targetScreen = Vector2.new(sp2.X, sp2.Y)
-            local currentMouse = Vector2.new(mousePos.X, mousePos.Y)
-
-            -- Move cursor toward target via smooth lerp delta
-            local delta = targetScreen - currentMouse
-            local smoothed = delta * math.clamp(CFG.AimSmooth, 0.01, 1)
-
-            -- Only move if there's a meaningful delta
-            if smoothed.Magnitude > 0.5 then
-                mousemoverel(smoothed.X, smoothed.Y)
+            -- Re-project with latest camera to get freshest screen pos
+            local sp2, onSc2 = Cam:WorldToViewportPoint(bestPart.Position)
+            if not onSc2 then
+                hideCrosshair(); State.lockedTarget=nil; State.crossVisible=false; return
             end
 
-            -- Crosshair at target bone screen pos
-            updateCrosshair(targetScreen, true)
+            local targetScreen = Vector2.new(sp2.X, sp2.Y)
+            local currentMouse = Vector2.new(mousePos.X, mousePos.Y)
+            local delta        = targetScreen - currentMouse
 
+            local smooth = math.clamp(CFG.AimSmooth, 0.05, 1.0)
+
+            if smooth >= 0.95 then
+                -- Instant snap — move entire delta
+                if delta.Magnitude > 0.3 then
+                    mousemoverel(delta.X, delta.Y)
+                end
+            else
+                -- Smooth tracking: scale by smoothness AND dt so it's frame-rate independent
+                -- Base speed factor maps 0.05→very slow, 0.94→very fast
+                local factor = smooth * (dt / 0.016667) -- normalise to 60fps baseline
+                local move   = delta * math.clamp(factor, 0, 1)
+                if move.Magnitude > 0.3 then
+                    mousemoverel(move.X, move.Y)
+                end
+            end
+
+            -- Draw crosshair at target position
+            updateCrosshair(targetScreen, true)
             State.lockedTarget = bestPlayer
             State.crossVisible = true
         else
@@ -366,7 +564,7 @@ end
 -- ══════════════════════════════════════
 -- CONFIG SAVE / LOAD
 -- ══════════════════════════════════════
-local CFG_FILE="Galaxus_v52.txt"
+local CFG_FILE="Galaxus_v53.txt"
 local function saveCFG()
     pcall(function()
         local t={}
@@ -405,7 +603,7 @@ SG.Name="GalaxusUI"; SG.ResetOnSpawn=false
 SG.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 SG.DisplayOrder=9999; SG.Parent=GuiParent
 
-local W,H=560,620
+local W,H=580,640
 
 local main=Instance.new("Frame",SG)
 main.Size=UDim2.new(0,W,0,H); main.Position=UDim2.new(0.5,-W/2,0.5,-H/2)
@@ -427,7 +625,6 @@ spaceBG.Size=UDim2.new(1,0,1,0); spaceBG.BackgroundColor3=Color3.fromRGB(2,1,10)
 spaceBG.BorderSizePixel=0; spaceBG.ZIndex=1
 Instance.new("UICorner",spaceBG).CornerRadius=UDim.new(0,18)
 
--- Galaxy gradient layers
 local function mkLayer(c1,c2,rot,trans,zi)
     local f=Instance.new("Frame",main)
     f.Size=UDim2.new(1,0,1,0); f.BackgroundColor3=c1
@@ -517,15 +714,12 @@ task.spawn(function()
     end
 end)
 
--- Border
 local border=Instance.new("UIStroke",main)
 border.Color=Color3.fromRGB(160,60,255); border.Thickness=2; border.Transparency=0.2
 
 -- ══════════════════════════════════════════════════════════
--- LAYOUT: Sidebar + Content Area
--- ══════════════════════════════════════════════════════════
-
 -- TOP BAR
+-- ══════════════════════════════════════════════════════════
 local topBar=Instance.new("Frame",main)
 topBar.Size=UDim2.new(1,0,0,52); topBar.BackgroundColor3=Color3.fromRGB(8,3,22)
 topBar.BackgroundTransparency=0.08; topBar.BorderSizePixel=0; topBar.ZIndex=20
@@ -545,7 +739,7 @@ titleLbl.TextSize=20; titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl
 
 local verLbl=Instance.new("TextLabel",topBar)
 verLbl.Size=UDim2.new(0,50,0,14); verLbl.Position=UDim2.new(0,156,0.5,-2)
-verLbl.BackgroundTransparency=1; verLbl.Text="v5.2"
+verLbl.BackgroundTransparency=1; verLbl.Text="v5.3"
 verLbl.TextColor3=Color3.fromRGB(110,60,180); verLbl.Font=Enum.Font.Gotham
 verLbl.TextSize=10; verLbl.ZIndex=21
 
@@ -570,36 +764,44 @@ alG.Color=ColorSequence.new{
     ColorSequenceKeypoint.new(1,Color3.fromRGB(80,0,160))
 }
 
+-- ══════════════════════════════════════════════════════════
 -- SIDEBAR
-local SIDEBAR_W = 120
+-- ══════════════════════════════════════════════════════════
+local SIDEBAR_W = 125
 local sidebar=Instance.new("Frame",main)
-sidebar.Size=UDim2.new(0,SIDEBAR_W,1,-58); sidebar.Position=UDim2.new(0,0,0,54)
-sidebar.BackgroundColor3=Color3.fromRGB(6,2,18); sidebar.BackgroundTransparency=0.1
+sidebar.Size=UDim2.new(0,SIDEBAR_W,1,-58); sidebar.Position=UDim2.new(0,4,0,55)
+sidebar.BackgroundColor3=Color3.fromRGB(6,2,18); sidebar.BackgroundTransparency=0.05
 sidebar.BorderSizePixel=0; sidebar.ZIndex=15
-local sbCorner=Instance.new("UICorner",sidebar)
-sbCorner.CornerRadius=UDim.new(0,14)
+Instance.new("UICorner",sidebar).CornerRadius=UDim.new(0,14)
 local sbStroke=Instance.new("UIStroke",sidebar)
-sbStroke.Color=Color3.fromRGB(100,30,180); sbStroke.Thickness=1; sbStroke.Transparency=0.5
+sbStroke.Color=Color3.fromRGB(100,30,180); sbStroke.Thickness=1; sbStroke.Transparency=0.4
 
 local sbLayout=Instance.new("UIListLayout",sidebar)
-sbLayout.Padding=UDim.new(0,4); sbLayout.FillDirection=Enum.FillDirection.Vertical
+sbLayout.Padding=UDim.new(0,5); sbLayout.FillDirection=Enum.FillDirection.Vertical
 sbLayout.HorizontalAlignment=Enum.HorizontalAlignment.Center
 sbLayout.VerticalAlignment=Enum.VerticalAlignment.Top
 local sbPad=Instance.new("UIPadding",sidebar)
-sbPad.PaddingTop=UDim.new(0,10); sbPad.PaddingBottom=UDim.new(0,8)
+sbPad.PaddingTop=UDim.new(0,12); sbPad.PaddingBottom=UDim.new(0,10)
 
--- Sidebar divider line
+-- Sidebar divider
 local sbDivider=Instance.new("Frame",main)
-sbDivider.Size=UDim2.new(0,1.5,1,-60); sbDivider.Position=UDim2.new(0,SIDEBAR_W,0,55)
+sbDivider.Size=UDim2.new(0,1.5,1,-60); sbDivider.Position=UDim2.new(0,SIDEBAR_W+4,0,56)
 sbDivider.BackgroundColor3=Color3.fromRGB(120,40,220); sbDivider.BorderSizePixel=0; sbDivider.ZIndex=16
+local sdG=Instance.new("UIGradient",sbDivider)
+sdG.Color=ColorSequence.new{
+    ColorSequenceKeypoint.new(0,Color3.fromRGB(60,0,140)),
+    ColorSequenceKeypoint.new(0.5,Color3.fromRGB(200,80,255)),
+    ColorSequenceKeypoint.new(1,Color3.fromRGB(60,0,140))
+}
+sdG.Rotation=90
 
--- CONTENT AREA (right of sidebar)
+-- Content area
 local contentHolder=Instance.new("Frame",main)
-contentHolder.Size=UDim2.new(1,-SIDEBAR_W-6,1,-60)
-contentHolder.Position=UDim2.new(0,SIDEBAR_W+6,0,56)
+contentHolder.Size=UDim2.new(1,-SIDEBAR_W-14,1,-62)
+contentHolder.Position=UDim2.new(0,SIDEBAR_W+12,0,57)
 contentHolder.BackgroundTransparency=1; contentHolder.ClipsDescendants=true; contentHolder.ZIndex=10
 
--- ── DRAG ─────────────────────────────────────────────────
+-- ── DRAG ──────────────────────────────────────────────────
 topBar.InputBegan:Connect(function(i)
     if i.UserInputType==Enum.UserInputType.MouseButton1 then
         State.dragOn=true; State.dragStart=i.Position; State.dragStartPos=main.Position
@@ -647,7 +849,7 @@ local function mkPage()
     ll.HorizontalAlignment=Enum.HorizontalAlignment.Center
     local pp=Instance.new("UIPadding",sf)
     pp.PaddingTop=UDim.new(0,8); pp.PaddingBottom=UDim.new(0,10)
-    pp.PaddingRight=UDim.new(0,6)
+    pp.PaddingRight=UDim.new(0,4)
     return sf
 end
 
@@ -681,6 +883,7 @@ local function mkLbl(par,txt)
     l.BackgroundTransparency=1; l.TextColor3=Color3.fromRGB(220,200,255)
     l.Font=Enum.Font.GothamSemibold; l.TextSize=13
     l.TextXAlignment=Enum.TextXAlignment.Left; l.Text=txt
+    return l
 end
 
 local function mkToggle(par,txt,get,set)
@@ -732,7 +935,12 @@ local function mkSlider(par,txt,mn,mx,get,set,fmt)
     local function ref()
         local v=get(); local p=math.clamp((v-mn)/(mx-mn),0,1)
         fill.Size=UDim2.new(p,0,1,0); thumb.Position=UDim2.new(p,0,0.5,0)
-        valLbl.Text=fmt and fmt:format(v) or ("%.2f"):format(v)
+        -- Special label for smoothness at max
+        if fmt=="SMOOTH" then
+            valLbl.Text = v>=0.95 and "INSTANT" or ("%.2f"):format(v)
+        else
+            valLbl.Text=fmt and fmt:format(v) or ("%.2f"):format(v)
+        end
     end
     ref()
     local drag=false
@@ -781,7 +989,6 @@ local function mkInfo(par,txt)
     l.TextXAlignment=Enum.TextXAlignment.Left; l.Text=txt
 end
 
--- mkBind: fixed so updating the bind ALSO replaces the live keybind in BINDS table
 local function mkBind(par,label,bindKey)
     local row=mkRow(par); mkLbl(row,label)
     local btn=Instance.new("TextButton",row)
@@ -807,7 +1014,6 @@ local function mkBind(par,label,bindKey)
     end)
 end
 
--- Dropdown / option cycle for AimBone
 local function mkOption(par,txt,options,get,set)
     local row=mkRow(par); mkLbl(row,txt)
     local btn=Instance.new("TextButton",row)
@@ -818,8 +1024,7 @@ local function mkOption(par,txt,options,get,set)
     Instance.new("UICorner",btn).CornerRadius=UDim.new(0,8)
     Instance.new("UIStroke",btn).Color=Color3.fromRGB(120,40,200)
     btn.MouseButton1Click:Connect(function()
-        local cur=get()
-        local idx=1
+        local cur=get(); local idx=1
         for i,v in ipairs(options) do if v==cur then idx=i; break end end
         idx=(idx%#options)+1
         set(options[idx]); btn.Text=options[idx]; saveCFG()
@@ -849,7 +1054,7 @@ end
 
 for i,td in ipairs(tabDefs) do
     local tb=Instance.new("TextButton",sidebar)
-    tb.Size=UDim2.new(0.9,0,0,44); tb.BorderSizePixel=0
+    tb.Size=UDim2.new(0.88,0,0,50); tb.BorderSizePixel=0
     tb.BackgroundColor3=i==1 and Color3.fromRGB(110,30,210) or Color3.fromRGB(10,4,30)
     tb.TextColor3=i==1 and Color3.fromRGB(255,220,255) or Color3.fromRGB(120,80,180)
     tb.Font=Enum.Font.GothamBold; tb.TextSize=11
@@ -865,13 +1070,35 @@ end
 -- ══════════════════════════════════════════════════════════
 local P1=PAGES[1]
 mkSec(P1,"Cursor Proximity Lock")
-mkToggle(P1,"Aimbot Enabled",
-    function() return CFG.AimOn end,
-    function(v) CFG.AimOn=v; if v then startAimbot() else stopAimbot() end end)
 
-mkSlider(P1,"Smoothness",0.05,0.95,
+local aimToggleRef
+aimToggleRef = mkToggle(P1,"Aimbot Enabled",
+    function() return CFG.AimOn end,
+    function(v)
+        CFG.AimOn=v
+        if v then startAimbot() else stopAimbot() end
+    end)
+
+-- Hold mode toggle — when enabled, keybind holds instead of toggles
+mkToggle(P1,"Hold Mode (hold key)",
+    function() return CFG.AimHold end,
+    function(v)
+        CFG.AimHold=v
+        -- If switching to hold, turn off any active toggle aim
+        if v and CFG.AimOn then
+            CFG.AimOn=false
+            if aimToggleRef then aimToggleRef() end
+        end
+        startAimbot()
+    end)
+
+mkToggle(P1,"Always Show FOV",
+    function() return CFG.AimShowFOV end,
+    function(v) CFG.AimShowFOV=v end)
+
+mkSlider(P1,"Smoothness",0.05,1.0,
     function() return CFG.AimSmooth end,
-    function(v) CFG.AimSmooth=v end,"%.2f")
+    function(v) CFG.AimSmooth=v end,"SMOOTH")
 
 mkSlider(P1,"FOV Radius (px)",30,600,
     function() return CFG.AimFOV end,
@@ -884,20 +1111,20 @@ mkSlider(P1,"Max Distance",100,2500,
     function() return CFG.AimMaxDist end,
     function(v) CFG.AimMaxDist=v end,"%.0f")
 
-mkSec(P1,"Target Bone")
-mkOption(P1,"Track",{"Head","HumanoidRootPart"},
+mkSec(P1,"Target")
+mkOption(P1,"Track Bone",{"Head","HumanoidRootPart"},
     function() return CFG.AimBone end,
     function(v) CFG.AimBone=v end)
-mkInfo(P1,"Head = headshots. HumanoidRootPart = torso/body tracking.")
+mkInfo(P1,"Head = headshots · Torso = body. Smoothness MAX = instant snap.")
 
 mkSec(P1,"Keybind")
-mkBind(P1,"Toggle Aimbot","AimKey")
+mkBind(P1,"Toggle / Hold Aimbot","AimKey")
 
 -- ══════════════════════════════════════════════════════════
 -- PAGE 2 — VISUALS
 -- ══════════════════════════════════════════════════════════
 local P2=PAGES[2]
-mkSec(P2,"ESP")
+mkSec(P2,"ESP Highlights")
 mkToggle(P2,"ESP Enabled",
     function() return CFG.ESPOn end,
     function(v) CFG.ESPOn=v; applyESP() end)
@@ -908,7 +1135,20 @@ mkToggle(P2,"Outline Only",
     function() return CFG.ESPOutlineOnly end,
     function(v) CFG.ESPOutlineOnly=v; applyESP() end)
 mkInfo(P2,"Purple highlights on all enemy characters.")
-mkBtn(P2,"Refresh ESP", Color3.fromRGB(80,30,160), applyESP)
+
+mkSec(P2,"ESP Boxes")
+mkToggle(P2,"Show Boxes",
+    function() return CFG.ESPBoxes end,
+    function(v)
+        CFG.ESPBoxes=v
+        if v then startBoxes() else clearBoxes() end
+    end)
+mkInfo(P2,"2D bounding box: 🟢 Green = visible · 🔴 Red = behind wall")
+
+mkBtn(P2,"Refresh ESP", Color3.fromRGB(80,30,160), function()
+    applyESP()
+    if CFG.ESPBoxes then startBoxes() end
+end)
 
 -- ══════════════════════════════════════════════════════════
 -- PAGE 3 — MOVEMENT
@@ -940,21 +1180,24 @@ mkBind(P4,"Open/Close Menu","MenuKey")
 mkSec(P4,"Config")
 mkBtn(P4,"Save Config",   Color3.fromRGB(40,20,100), saveCFG)
 mkBtn(P4,"Reset All",     Color3.fromRGB(80,15,30),  function()
-    CFG.AimOn=false; CFG.AimSmooth=0.18; CFG.AimFOV=150; CFG.AimMaxDist=1200
-    CFG.AimBone="Head"; CFG.FlyOn=false; CFG.FlySpeed=80
-    CFG.NoclipOn=false; CFG.ESPOn=true; CFG.ESPWalls=true
-    CFG.ESPOutlineOnly=false
-    stopAimbot(); stopFly(); stopNoclip()
-    local function clearESP2() for _,h in ipairs(State.espHL) do pcall(function() h:Destroy() end) end; State.espHL={} end
-    clearESP2(); applyESP(); saveCFG()
+    CFG.AimOn=false; CFG.AimHold=false; CFG.AimSmooth=0.18; CFG.AimFOV=150
+    CFG.AimMaxDist=1200; CFG.AimBone="Head"; CFG.AimShowFOV=true
+    CFG.FlyOn=false; CFG.FlySpeed=80; CFG.NoclipOn=false
+    CFG.ESPOn=true; CFG.ESPWalls=true; CFG.ESPOutlineOnly=false; CFG.ESPBoxes=false
+    stopAimbot(); stopFly(); stopNoclip(); clearBoxes(); clearESP(); applyESP(); saveCFG()
 end)
 
--- ── HUD STRIP ────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════
+-- HUD INDICATOR — TOP RIGHT of screen
+-- ══════════════════════════════════════════════════════════
+local HUD_W, HUD_H = 220, 36
 local hudStrip=Instance.new("Frame",SG)
-hudStrip.Size=UDim2.new(0,420,0,46); hudStrip.Position=UDim2.new(0.5,-210,0,8)
-hudStrip.BackgroundColor3=Color3.fromRGB(4,2,14); hudStrip.BackgroundTransparency=0.1
+hudStrip.Size=UDim2.new(0,HUD_W,0,HUD_H)
+-- Top-right: anchor right edge 8px from screen edge, 8px from top
+hudStrip.Position=UDim2.new(1,-HUD_W-8,0,8)
+hudStrip.BackgroundColor3=Color3.fromRGB(4,2,14); hudStrip.BackgroundTransparency=0.08
 hudStrip.BorderSizePixel=0
-Instance.new("UICorner",hudStrip).CornerRadius=UDim.new(0,12)
+Instance.new("UICorner",hudStrip).CornerRadius=UDim.new(0,10)
 local hsG=Instance.new("UIGradient",hudStrip)
 hsG.Color=ColorSequence.new{
     ColorSequenceKeypoint.new(0,Color3.fromRGB(30,8,70)),
@@ -964,8 +1207,10 @@ hsG.Color=ColorSequence.new{
 local hsStroke=Instance.new("UIStroke",hudStrip)
 hsStroke.Color=Color3.fromRGB(160,60,255); hsStroke.Thickness=1.2
 
+-- Top accent bar
 local hudBar2=Instance.new("Frame",hudStrip)
-hudBar2.Size=UDim2.new(1,0,0,1.5); hudBar2.BackgroundColor3=Color3.fromRGB(160,60,255); hudBar2.BorderSizePixel=0
+hudBar2.Size=UDim2.new(1,0,0,1.5)
+hudBar2.BackgroundColor3=Color3.fromRGB(160,60,255); hudBar2.BorderSizePixel=0
 local hbG=Instance.new("UIGradient",hudBar2)
 hbG.Color=ColorSequence.new{
     ColorSequenceKeypoint.new(0,Color3.fromRGB(100,0,200)),
@@ -973,18 +1218,21 @@ hbG.Color=ColorSequence.new{
     ColorSequenceKeypoint.new(1,Color3.fromRGB(100,0,200))
 }
 
+-- Title label (left side of HUD)
 local hudTitle2=Instance.new("TextLabel",hudStrip)
-hudTitle2.Size=UDim2.new(0,100,1,0); hudTitle2.Position=UDim2.new(0,10,0,0)
+hudTitle2.Size=UDim2.new(0,78,1,0); hudTitle2.Position=UDim2.new(0,8,0,0)
 hudTitle2.BackgroundTransparency=1; hudTitle2.Text="✦ GALAXUS"
-hudTitle2.TextColor3=Color3.fromRGB(200,130,255); hudTitle2.Font=Enum.Font.GothamBold; hudTitle2.TextSize=13
+hudTitle2.TextColor3=Color3.fromRGB(200,130,255); hudTitle2.Font=Enum.Font.GothamBold; hudTitle2.TextSize=11
 hudTitle2.TextXAlignment=Enum.TextXAlignment.Left
 
+-- Status label (right side)
 local hudLock=Instance.new("TextLabel",hudStrip)
-hudLock.Size=UDim2.new(1,-120,1,0); hudLock.Position=UDim2.new(0,110,0,0)
-hudLock.BackgroundTransparency=1; hudLock.Text="INSERT = Menu"
-hudLock.TextColor3=Color3.fromRGB(140,90,200); hudLock.Font=Enum.Font.GothamBold; hudLock.TextSize=11
-hudLock.TextXAlignment=Enum.TextXAlignment.Center
+hudLock.Size=UDim2.new(1,-86,1,0); hudLock.Position=UDim2.new(0,82,0,0)
+hudLock.BackgroundTransparency=1; hudLock.Text="OFF"
+hudLock.TextColor3=Color3.fromRGB(140,90,200); hudLock.Font=Enum.Font.GothamBold; hudLock.TextSize=10
+hudLock.TextXAlignment=Enum.TextXAlignment.Right
 
+-- Hue cycle + status update
 task.spawn(function()
     local hue=0
     while hudStrip and hudStrip.Parent do
@@ -992,23 +1240,26 @@ task.spawn(function()
         local rc=hsv(hue,0.85,1)
         hsStroke.Color=rc; hudBar2.BackgroundColor3=rc
         border.Color=rc; accentLine.BackgroundColor3=rc
-        sbStroke.Color=rc
+        sbStroke.Color=rc; sbDivider.BackgroundColor3=rc
 
-        if State.lockedTarget and CFG.AimOn then
-            hudLock.Text="🎯 LOCKED → "..State.lockedTarget.Name.." ["..CFG.AimBone.."]"
+        -- Status text
+        if State.lockedTarget and aimActive() then
+            hudLock.Text="🎯 "..State.lockedTarget.Name
             hudLock.TextColor3=Color3.fromRGB(255,80,80)
         else
             local parts={}
-            if CFG.AimOn    then parts[#parts+1]="◉ AIM["..CFG.AimBone:sub(1,1).."]" end
-            if CFG.ESPOn    then parts[#parts+1]="◈ ESP" end
-            if CFG.FlyOn    then parts[#parts+1]="✈ FLY" end
-            if CFG.NoclipOn then parts[#parts+1]="◌ CLIP" end
+            local aimActive2 = CFG.AimHold and State.aimHolding or CFG.AimOn
+            if aimActive2    then parts[#parts+1]="AIM" end
+            if CFG.ESPOn     then parts[#parts+1]="ESP" end
+            if CFG.ESPBoxes  then parts[#parts+1]="BOX" end
+            if CFG.FlyOn     then parts[#parts+1]="FLY" end
+            if CFG.NoclipOn  then parts[#parts+1]="CLIP" end
             if #parts>0 then
-                hudLock.Text=table.concat(parts,"  ·  ")
+                hudLock.Text=table.concat(parts," · ")
                 hudLock.TextColor3=Color3.fromRGB(200,150,255)
             else
-                hudLock.Text=BINDS.MenuKey.." = Menu"
-                hudLock.TextColor3=Color3.fromRGB(140,90,200)
+                hudLock.Text=BINDS.MenuKey.."=Menu"
+                hudLock.TextColor3=Color3.fromRGB(100,70,160)
             end
         end
     end
@@ -1029,7 +1280,7 @@ task.spawn(function()
 end)
 
 -- ══════════════════════════════════════
--- HOTKEY HANDLER (reads live BINDS table)
+-- HOTKEY HANDLER
 -- ══════════════════════════════════════
 UserInput.InputBegan:Connect(function(inp, gp)
     if gp then return end
@@ -1048,21 +1299,38 @@ UserInput.InputBegan:Connect(function(inp, gp)
     end
 
     if keyName == BINDS.AimKey then
-        CFG.AimOn = not CFG.AimOn
-        if CFG.AimOn then startAimbot() else stopAimbot() end
-        saveCFG()
+        if CFG.AimHold then
+            -- Hold mode: activate on key down
+            State.aimHolding = true
+        else
+            -- Toggle mode
+            CFG.AimOn = not CFG.AimOn
+            if CFG.AimOn then startAimbot() else stopAimbot() end
+            saveCFG()
+        end
     end
 
     if keyName == BINDS.FlyKey then
         CFG.FlyOn = not CFG.FlyOn
-        if CFG.FlyOn then startFly() else stopFly() end
-        saveCFG()
+        if CFG.FlyOn then startFly() else stopFly() end; saveCFG()
     end
 
     if keyName == BINDS.NoclipKey then
         CFG.NoclipOn = not CFG.NoclipOn
-        if CFG.NoclipOn then startNoclip() else stopNoclip() end
-        saveCFG()
+        if CFG.NoclipOn then startNoclip() else stopNoclip() end; saveCFG()
+    end
+end)
+
+UserInput.InputEnded:Connect(function(inp, gp)
+    if gp then return end
+    if inp.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    local keyName = tostring(inp.KeyCode):gsub("Enum%.KeyCode%.","")
+
+    if keyName == BINDS.AimKey and CFG.AimHold then
+        -- Hold mode: deactivate on key up
+        State.aimHolding = false
+        hideCrosshair()
+        State.lockedTarget = nil
     end
 end)
 
@@ -1070,13 +1338,15 @@ end)
 LP.CharacterAdded:Connect(function()
     task.wait(1.2)
     applyESP()
+    if CFG.ESPBoxes   then startBoxes()                end
     if CFG.FlyOn      then task.wait(0.3); startFly()  end
-    if CFG.NoclipOn   then startNoclip()                end
-    if CFG.AimOn      then startAimbot()                end
+    if CFG.NoclipOn   then startNoclip()               end
+    if CFG.AimOn or CFG.AimHold then startAimbot()     end
 end)
 
 -- Init
 applyESP()
-if CFG.AimOn then startAimbot() end
+if CFG.ESPBoxes then startBoxes() end
+if CFG.AimOn or CFG.AimHold then startAimbot() end
 
-print("✦ Galaxus v5.2 | "..BINDS.MenuKey.."=Menu | "..BINDS.AimKey.."=Aim | "..BINDS.FlyKey.."=Fly | "..BINDS.NoclipKey.."=Noclip")
+print("✦ Galaxus v5.3 | "..BINDS.MenuKey.."=Menu | "..BINDS.AimKey.."=Aim | "..BINDS.FlyKey.."=Fly | "..BINDS.NoclipKey.."=Noclip")
